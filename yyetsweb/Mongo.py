@@ -8,6 +8,7 @@
 __author__ = "Benny <benny.think@gmail.com>"
 
 import base64
+import binascii
 import contextlib
 import json
 import logging
@@ -36,7 +37,7 @@ from database import (AnnouncementResource, BlacklistResource, CaptchaResource,
                       GrafanaQueryResource, LikeResource, MetricsResource,
                       NameResource, NotificationResource, OtherResource, Redis,
                       ResourceLatestResource, ResourceResource, TopResource,
-                      UserEmailResource, UserResource)
+                      UserEmailResource, UserRegisterResource, UserResource)
 from utils import check_spam, send_mail, ts_date
 
 lib_path = pathlib.Path(__file__).parent.parent.joinpath("yyetsbot").resolve().as_posix()
@@ -700,18 +701,24 @@ class LikeMongoResource(LikeResource, Mongo):
 
 
 class UserMongoResource(UserResource, Mongo):
-    def login_user(self, username: str, password: str, captcha: str, captcha_id: str, ip: str, browser: str) -> dict:
-        # verify captcha in the first place.
+    @staticmethod
+    def verify_captcha(captcha: str, captcha_id) -> bool:
         redis = Redis().r
         correct_captcha = redis.get(captcha_id)
         if correct_captcha is None:
-            return {"status_code": HTTPStatus.BAD_REQUEST, "message": "验证码已过期", "status": False}
+            return False
         elif correct_captcha.lower() == captcha.lower():
             redis.expire(captcha_id, 0)
+            return True
         else:
-            return {"status_code": HTTPStatus.FORBIDDEN, "message": "验证码错误", "status": False}
-        # check user account is locked.
+            return False
 
+    def login_user(self, username: str, password: str, captcha: str, captcha_id: str, ip: str, browser: str) -> dict:
+        # verify captcha in the first place.
+        if not self.verify_captcha(captcha, captcha_id):
+            return {"status_code": HTTPStatus.FORBIDDEN, "message": "验证码错误或已过期", "status": False}
+
+        # check user account is locked.
         data = self.db["users"].find_one({"username": username}) or {}
         if data.get("status", {}).get("disable"):
             return {"status_code": HTTPStatus.FORBIDDEN,
@@ -725,29 +732,9 @@ class UserMongoResource(UserResource, Mongo):
             stored_password = data["password"]
             if pbkdf2_sha256.verify(password, stored_password):
                 returned_value["status_code"] = HTTPStatus.OK
-            else:
-                returned_value["status_code"] = HTTPStatus.FORBIDDEN
-                returned_value["message"] = "用户名或密码错误"
-
+                return returned_value
         else:
-            if os.getenv("DISABLE_REGISTER"):
-                return {"status_code": HTTPStatus.BAD_REQUEST, "message": "本站已经暂停注册"}
-
-            # register
-            hash_value = pbkdf2_sha256.hash(password)
-            try:
-                self.db["users"].insert_one(dict(username=username, password=hash_value,
-                                                 date=ts_date(), ip=ip, browser=browser)
-                                            )
-                returned_value["status_code"] = HTTPStatus.CREATED
-
-            except Exception as e:
-                returned_value["status_code"] = HTTPStatus.INTERNAL_SERVER_ERROR
-                returned_value["message"] = str(e)
-
-        returned_value["username"] = data.get("username")
-        returned_value["group"] = data.get("group", ["user"])
-        return returned_value
+            return {"status_code": HTTPStatus.FORBIDDEN, "message": "用户名或密码错误"}
 
     def get_user_info(self, username: str) -> dict:
         projection = {"_id": False, "password": False}
@@ -796,6 +783,53 @@ class UserMongoResource(UserResource, Mongo):
             {"$set": valid_data}
         )
         return {"status_code": HTTPStatus.CREATED, "status": True, "message": "success"}
+
+
+class UserRegisterMongoResource(UserRegisterResource, Mongo):
+    def register_user(self, username: str, password: str, captcha: str, captcha_id: str, email: str) -> dict:
+        if not UserMongoResource.verify_captcha(captcha, captcha_id):
+            return {"status_code": HTTPStatus.BAD_REQUEST, "message": "验证码错误或已过期", "status": False}
+        # check email is used or not
+        if self.db["users"].find_one({"email": email}):
+            return {"status_code": HTTPStatus.CONFLICT, "message": "邮箱已被注册", "status": False}
+
+        verification_code = binascii.hexlify(os.urandom(8)).decode()
+        hash_value = pbkdf2_sha256.hash(password)
+        returned_value = {}
+        try:
+            self.db["users"].insert_one(dict(username=username,
+                                             password=hash_value,
+                                             date=ts_date(),
+                                             email=email,
+                                             verification_code=verification_code,
+                                             status={"disable": True, "reason": "尚未验证邮箱"},
+                                             group=["user"]
+                                             )
+                                        )
+            returned_value["status_code"] = HTTPStatus.CREATED
+
+        except Exception as e:
+            returned_value["status_code"] = HTTPStatus.INTERNAL_SERVER_ERROR
+            returned_value["message"] = str(e)
+        link = f"https://yyets.dmesg.app/api/user/register?code={verification_code}"
+        body = "{} 您好，<br>请点击<a href='{}'>此链接</a>完成注册 ".format(username, link)
+
+        send_mail(email, "欢迎注册", body)
+
+        returned_value["username"] = username
+        return returned_value
+
+    def verify_user(self, code: str) -> dict:
+        user = self.db["users"].find_one({"verification_code": code})
+        if user:
+            db_code = user.get("verification_code")
+            if db_code == code:
+                self.db["users"].update_one({"_id": user["_id"]},
+                                            {"$unset": {"status": "", "verification_code": ""}})
+                return {"status_code": HTTPStatus.OK, "status": True, "message": "success",
+                        "username": user.get("username")}
+
+        return {"status_code": HTTPStatus.NOT_FOUND, "status": False, "message": "not found"}
 
 
 class DoubanMongoResource(DoubanResource, Mongo):

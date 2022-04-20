@@ -74,6 +74,14 @@ class UserResource:
         pass
 
 
+class UserRegisterResource:
+    def register_user(self, username: str, password: str, captcha: str, captcha_id: str, email: str) -> dict:
+        pass
+
+    def verify_user(self, code: str) -> dict:
+        pass
+
+
 class TopResource:
 
     def get_most(self) -> list:

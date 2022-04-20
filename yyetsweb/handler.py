@@ -228,6 +228,37 @@ class UserHandler(BaseHandler):
         self.write(resp)
 
 
+class UserRegisterHandler(UserHandler):
+    class_name = f"UserRegister{adapter}Resource"
+
+    from Mongo import UserRegisterMongoResource
+    instance = UserRegisterMongoResource()
+
+    @run_on_executor()
+    def register_user(self):
+        data = self.instance.register_user(**self.json)
+        self.set_status(data.get("status_code", HTTPStatus.IM_A_TEAPOT))
+        return data
+
+    @run_on_executor()
+    def verify_user(self):
+        data = self.instance.verify_user(self.get_query_argument("code"))
+        self.set_status(data["status_code"])
+        if data["status_code"] == HTTPStatus.OK:
+            self.set_login(data["username"])
+        return data
+
+    @gen.coroutine
+    def post(self):
+        resp = yield self.register_user()
+        self.write(resp)
+
+    @gen.coroutine
+    def get(self):
+        resp = yield self.verify_user()
+        self.write(resp)
+
+
 class ResourceHandler(BaseHandler):
     class_name = f"Resource{adapter}Resource"
 
